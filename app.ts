@@ -173,10 +173,11 @@ function sendJson(
   headers: Readonly<Record<string, string>> = {}
 ): void {
   const buf = Buffer.from(JSON.stringify(body), 'utf8');
+  res.cork();
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': buf.length,
-    'x-github-request-id': nextRequestId(),
+    'x-github-request-id': (reqIdCounter++).toString(16),
     ...headers,
   });
   res.end(buf);
@@ -188,10 +189,11 @@ function sendJsonBuffer(
   buf: Buffer,
   headers: Readonly<Record<string, string>> = {}
 ): void {
+  res.cork();
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'content-length': buf.length,
-    'x-github-request-id': nextRequestId(),
+    'x-github-request-id': (reqIdCounter++).toString(16),
     ...headers,
   });
   res.end(buf);
@@ -199,7 +201,7 @@ function sendJsonBuffer(
 
 function sendNoContent(res: ServerResponse): void {
   res.writeHead(204, {
-    'x-github-request-id': nextRequestId(),
+    'x-github-request-id': (reqIdCounter++).toString(16),
   });
   res.end();
 }
@@ -219,21 +221,11 @@ async function parseBody(req: IncomingMessage): Promise<any> {
 export function createApp(): Server {
   const store = new ForgeStore();
 
-  return createServer(async (req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const method = req.method ?? 'GET';
     const rawUrl = req.url ?? '/';
     const qIdx = rawUrl.indexOf('?');
     const path = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
-
-    let _lazyUrl: URL | undefined;
-    const parsedUrl = {
-      get searchParams() {
-        return (_lazyUrl ??= new URL(rawUrl, 'http://127.0.0.1')).searchParams;
-      },
-      get pathname() {
-        return path;
-      },
-    };
 
     // Fast path: GET /api/v3/repos/:owner/:repo/issues/:num (the 2000-call 'read' benchmark)
     if (method === 'GET' && path.charCodeAt(0) === 47 && path.startsWith('/api/v3/repos/')) {
@@ -272,11 +264,115 @@ export function createApp(): Server {
       }
     }
 
+    // Fast path: info/refs (GET)
+    if (method === 'GET' && path.endsWith('/info/refs')) {
+      const prefix = path.slice(1, -10);
+      const s = prefix.indexOf('/');
+      if (s !== -1) {
+        let gitOwner = prefix.slice(0, s);
+        let gitRepoName = prefix.slice(s + 1);
+        if (gitRepoName.endsWith('.git')) gitRepoName = gitRepoName.slice(0, -4);
+        const repo = store.getRepo(gitOwner, gitRepoName);
+        if (!repo) {
+          res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+          res.end('Repository not found\n');
+          return;
+        }
+        const parsedUrl = new URL(rawUrl, 'http://127.0.0.1');
+        handleGitInfoRefs(req, res, repo.gitRepo, parsedUrl);
+        return;
+      }
+    }
+
     // Health check
     if (method === 'GET' && path === '/healthz') {
       sendJson(res, 200, { ok: true });
       return;
     }
+
+    dispatch(req, res, method, rawUrl, path);
+  });
+
+  async function dispatch(
+    req: IncomingMessage,
+    res: ServerResponse,
+    method: string,
+    rawUrl: string,
+    path: string
+  ): Promise<void> {
+    // Fast path: POST /api/v3/repos/:owner/:repo/issues (the 200-call 'write' benchmark)
+    if (method === 'POST' && path.charCodeAt(0) === 47 && path.startsWith('/api/v3/repos/')) {
+      const rest = path.slice(14); // after '/api/v3/repos/'
+      const slash1 = rest.indexOf('/');
+      if (slash1 !== -1) {
+        const slash2 = rest.indexOf('/', slash1 + 1);
+        if (slash2 !== -1 && rest.slice(slash2) === '/issues') {
+          let body: any = {};
+          try {
+            body = await parseBody(req);
+          } catch {
+            sendJson(res, 400, { message: 'Problems parsing JSON' });
+            return;
+          }
+          const owner = rest.slice(0, slash1);
+          const repoName = rest.slice(slash1 + 1, slash2);
+          const repo = store.getRepo(owner, repoName);
+          if (!repo) {
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
+          const title = body?.title;
+          if (!title) {
+            sendJson(res, 422, { message: 'Title is required' });
+            return;
+          }
+          const labelNames: string[] = Array.isArray(body?.labels) ? body.labels : [];
+          const attachedLabels: Label[] = [];
+          if (labelNames.length > 0) {
+            for (const lName of labelNames) {
+              const found = repo.labels.get(lName);
+              if (!found) {
+                sendJson(res, 422, { message: `Label ${lName} does not exist` });
+                return;
+              }
+              attachedLabels.push(found);
+            }
+          }
+          const repoKey = `${owner}/${repoName}`;
+          const num = store.nextIssueNumber.get(repoKey) ?? 1;
+          store.nextIssueNumber.set(repoKey, num + 1);
+          const now = new Date().toISOString();
+          const issue: Issue = {
+            number: num,
+            id: store.nextId++,
+            title,
+            body: body?.body ?? '',
+            state: 'open',
+            labels: attachedLabels,
+            created_at: now,
+            updated_at: now,
+            closed_at: null,
+            comments: [],
+          };
+          const issueBuf = Buffer.from(JSON.stringify(issue), 'utf8');
+          issue._cachedJsonBuf = issueBuf;
+          repo.issues.push(issue);
+          repo.issuesMap.set(num, issue);
+          sendJsonBuffer(res, 201, issueBuf);
+          return;
+        }
+      }
+    }
+
+    let _lazyUrl: URL | undefined;
+    const parsedUrl = {
+      get searchParams() {
+        return (_lazyUrl ??= new URL(rawUrl, 'http://127.0.0.1')).searchParams;
+      },
+      get pathname() {
+        return path;
+      },
+    };
 
     // Git Smart-HTTP endpoints: /{owner}/{repo}(.git)/...
     let gitOwner = '';
@@ -301,15 +397,6 @@ export function createApp(): Server {
         gitRepoName = prefix.slice(s + 1);
         if (gitRepoName.endsWith('.git')) gitRepoName = gitRepoName.slice(0, -4);
       }
-    } else if (path.endsWith('/info/refs')) {
-      gitServicePath = 'info/refs';
-      const prefix = path.slice(1, -10);
-      const s = prefix.indexOf('/');
-      if (s !== -1) {
-        gitOwner = prefix.slice(0, s);
-        gitRepoName = prefix.slice(s + 1);
-        if (gitRepoName.endsWith('.git')) gitRepoName = gitRepoName.slice(0, -4);
-      }
     }
 
     if (gitServicePath !== '') {
@@ -321,11 +408,6 @@ export function createApp(): Server {
       }
 
       try {
-        if (gitServicePath === 'info/refs' && method === 'GET') {
-          const parsedUrl = new URL(rawUrl, 'http://127.0.0.1');
-          handleGitInfoRefs(req, res, repo.gitRepo, parsedUrl);
-          return;
-        }
         if (gitServicePath === 'git-upload-pack' && method === 'POST') {
           await handleGitUploadPack(req, res, repo.gitRepo);
           return;
@@ -376,62 +458,6 @@ export function createApp(): Server {
       }
     }
 
-    // Fast path: POST /api/v3/repos/:owner/:repo/issues (the 200-call 'write' benchmark)
-    if (method === 'POST' && path.charCodeAt(0) === 47 && path.startsWith('/api/v3/repos/')) {
-      const rest = path.slice(14); // after '/api/v3/repos/'
-      const slash1 = rest.indexOf('/');
-      if (slash1 !== -1) {
-        const slash2 = rest.indexOf('/', slash1 + 1);
-        if (slash2 !== -1 && rest.slice(slash2) === '/issues') {
-          const owner = rest.slice(0, slash1);
-          const repoName = rest.slice(slash1 + 1, slash2);
-          const repo = store.getRepo(owner, repoName);
-          if (!repo) {
-            sendJson(res, 404, { message: 'Not Found' });
-            return;
-          }
-          const title = body?.title;
-          if (!title) {
-            sendJson(res, 422, { message: 'Title is required' });
-            return;
-          }
-          const labelNames: string[] = Array.isArray(body?.labels) ? body.labels : [];
-          const attachedLabels: Label[] = [];
-          if (labelNames.length > 0) {
-            for (const lName of labelNames) {
-              const found = repo.labels.get(lName);
-              if (!found) {
-                sendJson(res, 422, { message: `Label ${lName} does not exist` });
-                return;
-              }
-              attachedLabels.push(found);
-            }
-          }
-          const repoKey = `${owner}/${repoName}`;
-          const num = store.nextIssueNumber.get(repoKey) ?? 1;
-          store.nextIssueNumber.set(repoKey, num + 1);
-          const now = new Date().toISOString();
-          const issue: Issue = {
-            number: num,
-            id: store.nextId++,
-            title,
-            body: body?.body ?? '',
-            state: 'open',
-            labels: attachedLabels,
-            created_at: now,
-            updated_at: now,
-            closed_at: null,
-            comments: [],
-          };
-          const issueBuf = Buffer.from(JSON.stringify(issue), 'utf8');
-          issue._cachedJsonBuf = issueBuf;
-          repo.issues.push(issue);
-          repo.issuesMap.set(num, issue);
-          sendJsonBuffer(res, 201, issueBuf);
-          return;
-        }
-      }
-    }
 
     // MCP Endpoint: /mcp
     if (path === '/mcp') {
@@ -1795,7 +1821,7 @@ export function createApp(): Server {
 
     // Fallback 404
     sendJson(res, 404, { message: 'Not Found' });
-  });
+  }
 
   server.on('connection', (socket) => {
     socket.setNoDelay(true);
