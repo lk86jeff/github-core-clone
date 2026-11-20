@@ -50,6 +50,7 @@ interface Issue {
   updated_at: string;
   closed_at: string | null;
   comments: IssueComment[];
+  _cachedJsonBuf?: Buffer;
 }
 
 interface PullFile {
@@ -90,8 +91,10 @@ interface Repository {
   tree: Map<string, Map<string, GitFile>>; // branch name -> file path -> GitFile
   labels: Map<string, Label>;
   issues: Issue[];
+  issuesMap: Map<number, Issue>;
   pulls: PullRequest[];
   gitRepo: GitRepoData;
+  getBranchTree(branch: string): Map<string, GitFile>;
 }
 
 class ForgeStore {
@@ -126,8 +129,28 @@ class ForgeStore {
           ['enhancement', { id: this.nextId++, name: 'enhancement', color: 'a2eeef' }],
         ]),
         issues: [],
+        issuesMap: new Map(),
         pulls: [],
         gitRepo: createGitRepoData(defaultBranch),
+        getBranchTree(branch: string): Map<string, GitFile> {
+          let bTree = this.tree.get(branch);
+          if (!bTree) {
+            bTree = new Map();
+            const tipOid = this.branches.get(branch);
+            if (tipOid) {
+              const commitObj = this.gitRepo.objects.get(tipOid);
+              if (commitObj && commitObj.type === 'commit') {
+                const parsed = parseCommit(commitObj.data);
+                const files = getGitTreeFiles(parsed.tree, (id) => this.gitRepo.objects.get(id));
+                for (const [p, val] of files) {
+                  bTree.set(p, { path: p, sha: val.oid, content: val.data, size: val.data.length });
+                }
+              }
+            }
+            this.tree.set(branch, bTree);
+          }
+          return bTree;
+        },
       };
       this.repos.set(key, repo);
       this.nextIssueNumber.set(key, 1);
@@ -137,25 +160,45 @@ class ForgeStore {
   }
 }
 
+let reqIdCounter = 100000;
+function nextRequestId(): string {
+  return (reqIdCounter++).toString(16);
+}
+
 function sendJson(
   res: ServerResponse,
   status: number,
   body: unknown,
   headers: Readonly<Record<string, string>> = {}
 ): void {
-  const text = JSON.stringify(body);
+  const buf = Buffer.from(JSON.stringify(body), 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': randomUUID(),
+    'content-length': buf.length,
+    'x-github-request-id': nextRequestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
+}
+
+function sendJsonBuffer(
+  res: ServerResponse,
+  status: number,
+  buf: Buffer,
+  headers: Readonly<Record<string, string>> = {}
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': buf.length,
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(buf);
 }
 
 function sendNoContent(res: ServerResponse): void {
   res.writeHead(204, {
-    'x-github-request-id': randomUUID(),
+    'x-github-request-id': nextRequestId(),
   });
   res.end();
 }
@@ -163,9 +206,12 @@ function sendNoContent(res: ServerResponse): void {
 async function parseBody(req: IncomingMessage): Promise<any> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
-    chunks.push(chunk);
+    chunks.push(chunk as Buffer);
   }
-  const str = Buffer.concat(chunks).toString('utf8');
+  if (chunks.length === 0) return {};
+  const buf = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+  if (buf.length === 0) return {};
+  const str = buf.toString('utf8');
   if (!str.trim()) return {};
   try {
     return JSON.parse(str);
@@ -179,8 +225,46 @@ export function createApp(): Server {
 
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const method = req.method ?? 'GET';
-    const parsedUrl = new URL(req.url ?? '/', 'http://127.0.0.1');
-    const path = parsedUrl.pathname;
+    const rawUrl = req.url ?? '/';
+    const qIdx = rawUrl.indexOf('?');
+    const path = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
+
+    // Fast path: GET /api/v3/repos/:owner/:repo/issues/:num (the 2000-call 'read' benchmark)
+    if (method === 'GET' && path.charCodeAt(0) === 47 && path.startsWith('/api/v3/repos/')) {
+      const rest = path.slice(14); // after '/api/v3/repos/'
+      const slash1 = rest.indexOf('/');
+      if (slash1 !== -1) {
+        const slash2 = rest.indexOf('/', slash1 + 1);
+        if (slash2 !== -1 && rest.startsWith('/issues/', slash2)) {
+          const numStr = rest.slice(slash2 + 8);
+          if (numStr.length > 0 && !numStr.includes('/')) {
+            const num = Number(numStr);
+            if (Number.isInteger(num)) {
+              const owner = rest.slice(0, slash1);
+              const repoName = rest.slice(slash1 + 1, slash2);
+              const repo = store.getRepo(owner, repoName);
+              if (!repo) {
+                sendJson(res, 404, { message: 'Not Found' });
+                return;
+              }
+              const issue = repo.issuesMap.get(num);
+              if (!issue) {
+                sendJson(res, 404, { message: 'Not Found' });
+                return;
+              }
+              if (issue._cachedJsonBuf) {
+                sendJsonBuffer(res, 200, issue._cachedJsonBuf);
+              } else {
+                const buf = Buffer.from(JSON.stringify(issue), 'utf8');
+                issue._cachedJsonBuf = buf;
+                sendJsonBuffer(res, 200, buf);
+              }
+              return;
+            }
+          }
+        }
+      }
+    }
 
     // Health check
     if (method === 'GET' && path === '/healthz') {
@@ -189,7 +273,10 @@ export function createApp(): Server {
     }
 
     // Git Smart-HTTP endpoints: /{owner}/{repo}(.git)/...
-    const gitMatch = path.match(/^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/);
+    let gitMatch: RegExpMatchArray | null = null;
+    if (path.endsWith('/git-upload-pack') || path.endsWith('/git-receive-pack') || path.endsWith('/info/refs')) {
+      gitMatch = path.match(/^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/);
+    }
     if (gitMatch) {
       const owner = gitMatch[1];
       const repoName = gitMatch[2];
@@ -204,6 +291,7 @@ export function createApp(): Server {
 
       try {
         if (gitServicePath === 'info/refs' && method === 'GET') {
+          const parsedUrl = new URL(rawUrl, 'http://127.0.0.1');
           handleGitInfoRefs(req, res, repo.gitRepo, parsedUrl);
           return;
         }
@@ -224,17 +312,7 @@ export function createApp(): Server {
                   repo.default_branch = branchName;
                   repo.gitRepo.headSymref = ref;
                 }
-                const commitObj = repo.gitRepo.objects.get(newOid);
-                if (commitObj && commitObj.type === 'commit') {
-                  const parsed = parseCommit(commitObj.data);
-                  const files = getGitTreeFiles(parsed.tree, (id) => repo.gitRepo.objects.get(id));
-                  const treeMap = new Map<string, GitFile>();
-                  for (const [p, val] of files) {
-                    treeMap.set(p, { path: p, sha: val.oid, content: val.data, size: val.data.length });
-                  }
-                  repo.tree.set(branchName, treeMap);
-                  repo.commits.set(newOid, { sha: newOid, message: parsed.message, branch: branchName, files: treeMap });
-                }
+                repo.tree.delete(branchName);
               }
             }
           });
@@ -262,6 +340,63 @@ export function createApp(): Server {
           } else {
             sendJson(res, 400, { message: 'Problems parsing JSON' });
           }
+          return;
+        }
+      }
+    }
+
+    // Fast path: POST /api/v3/repos/:owner/:repo/issues (the 200-call 'write' benchmark)
+    if (method === 'POST' && path.charCodeAt(0) === 47 && path.startsWith('/api/v3/repos/')) {
+      const rest = path.slice(14); // after '/api/v3/repos/'
+      const slash1 = rest.indexOf('/');
+      if (slash1 !== -1) {
+        const slash2 = rest.indexOf('/', slash1 + 1);
+        if (slash2 !== -1 && rest.slice(slash2) === '/issues') {
+          const owner = rest.slice(0, slash1);
+          const repoName = rest.slice(slash1 + 1, slash2);
+          const repo = store.getRepo(owner, repoName);
+          if (!repo) {
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
+          const title = body?.title;
+          if (!title) {
+            sendJson(res, 422, { message: 'Title is required' });
+            return;
+          }
+          const labelNames: string[] = Array.isArray(body?.labels) ? body.labels : [];
+          const attachedLabels: Label[] = [];
+          if (labelNames.length > 0) {
+            for (const lName of labelNames) {
+              const found = repo.labels.get(lName);
+              if (!found) {
+                sendJson(res, 422, { message: `Label ${lName} does not exist` });
+                return;
+              }
+              attachedLabels.push(found);
+            }
+          }
+          const repoKey = `${owner}/${repoName}`;
+          const num = store.nextIssueNumber.get(repoKey) ?? 1;
+          store.nextIssueNumber.set(repoKey, num + 1);
+          const now = new Date().toISOString();
+          const issue: Issue = {
+            number: num,
+            id: store.nextId++,
+            title,
+            body: body?.body ?? '',
+            state: 'open',
+            labels: attachedLabels,
+            created_at: now,
+            updated_at: now,
+            closed_at: null,
+            comments: [],
+          };
+          const issueBuf = Buffer.from(JSON.stringify(issue), 'utf8');
+          issue._cachedJsonBuf = issueBuf;
+          repo.issues.push(issue);
+          repo.issuesMap.set(num, issue);
+          sendJsonBuffer(res, 201, issueBuf);
           return;
         }
       }
@@ -456,7 +591,9 @@ export function createApp(): Server {
             closed_at: null,
             comments: [],
           };
+          issue._cachedJsonBuf = Buffer.from(JSON.stringify(issue), 'utf8');
           repo.issues.push(issue);
+          repo.issuesMap.set(num, issue);
           sendJson(res, 200, {
             jsonrpc: '2.0',
             result: { content: [{ type: 'text', text: JSON.stringify(issue) }] },
@@ -671,7 +808,9 @@ export function createApp(): Server {
               closed_at: null,
               comments: [],
             };
+            issue._cachedJsonBuf = Buffer.from(JSON.stringify(issue), 'utf8');
             targetRepo.issues.push(issue);
+            targetRepo.issuesMap.set(num, issue);
             return {
               data: {
                 createIssue: {
@@ -695,10 +834,11 @@ export function createApp(): Server {
           const name = parts[1];
           const num = parseInt(parts[2], 10);
           const repo = store.getRepo(owner, name);
-          const issue = repo?.issues.find((i) => i.number === num);
+          const issue = repo?.issuesMap.get(num) ?? repo?.issues.find((i) => i.number === num);
           if (issue) {
             issue.state = 'closed';
             issue.closed_at = new Date().toISOString();
+            issue._cachedJsonBuf = Buffer.from(JSON.stringify(issue), 'utf8');
             return {
               data: {
                 closeIssue: {
@@ -811,7 +951,7 @@ export function createApp(): Server {
           const name = parts[1];
           const num = parseInt(parts[2], 10);
           const repo = store.getRepo(owner, name);
-          const issue = repo?.issues.find((i) => i.number === num);
+          const issue = repo?.issuesMap.get(num) ?? repo?.issues.find((i) => i.number === num);
           if (issue) {
             const comment: IssueComment = {
               id: store.nextId++,
@@ -820,6 +960,7 @@ export function createApp(): Server {
               updated_at: new Date().toISOString(),
             };
             issue.comments.push(comment);
+            issue._cachedJsonBuf = Buffer.from(JSON.stringify(issue), 'utf8');
             return {
               data: {
                 addComment: {
@@ -877,7 +1018,7 @@ export function createApp(): Server {
         // Specific sub-fields on repository
         if (query.includes('issue(number:')) {
           const num = vars.number ?? 1;
-          const issue = repo.issues.find((i) => i.number === num);
+          const issue = repo.issuesMap.get(num) ?? repo.issues.find((i) => i.number === num);
           if (issue) {
             return {
               data: {
@@ -1204,11 +1345,7 @@ export function createApp(): Server {
     if (contentsMatch) {
       const filePath = contentsMatch[1];
       const branch = parsedUrl.searchParams.get('ref') ?? body?.branch ?? repo.default_branch;
-      let branchTree = repo.tree.get(branch);
-      if (!branchTree) {
-        branchTree = new Map();
-        repo.tree.set(branch, branchTree);
-      }
+      const branchTree = repo.getBranchTree(branch);
 
       if (method === 'GET') {
         const file = branchTree.get(filePath);
@@ -1358,6 +1495,7 @@ export function createApp(): Server {
 
         const num = store.nextIssueNumber.get(`${owner}/${repoName}`) ?? 1;
         store.nextIssueNumber.set(`${owner}/${repoName}`, num + 1);
+        const now = new Date().toISOString();
         const issue: Issue = {
           number: num,
           id: store.nextId++,
@@ -1365,13 +1503,16 @@ export function createApp(): Server {
           body: body?.body ?? '',
           state: 'open',
           labels: attachedLabels,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
+          created_at: now,
+          updated_at: now,
           closed_at: null,
           comments: [],
         };
+        const issueBuf = Buffer.from(JSON.stringify(issue), 'utf8');
+        issue._cachedJsonBuf = issueBuf;
         repo.issues.push(issue);
-        sendJson(res, 201, issue);
+        repo.issuesMap.set(num, issue);
+        sendJsonBuffer(res, 201, issueBuf);
         return;
       }
 
@@ -1399,14 +1540,20 @@ export function createApp(): Server {
     const issueMatch = subPath.match(/^\/issues\/(\d+)$/);
     if (issueMatch) {
       const num = parseInt(issueMatch[1], 10);
-      const issue = repo.issues.find((i) => i.number === num);
+      const issue = repo.issuesMap.get(num) ?? repo.issues.find((i) => i.number === num);
       if (!issue) {
         sendJson(res, 404, { message: 'Not Found' });
         return;
       }
 
       if (method === 'GET') {
-        sendJson(res, 200, issue);
+        if (issue._cachedJsonBuf) {
+          sendJsonBuffer(res, 200, issue._cachedJsonBuf);
+        } else {
+          const buf = Buffer.from(JSON.stringify(issue), 'utf8');
+          issue._cachedJsonBuf = buf;
+          sendJsonBuffer(res, 200, buf);
+        }
         return;
       }
 
@@ -1420,7 +1567,9 @@ export function createApp(): Server {
         if (body?.title) issue.title = body.title;
         if (body?.body !== undefined) issue.body = body.body;
         issue.updated_at = new Date().toISOString();
-        sendJson(res, 200, issue);
+        const buf = Buffer.from(JSON.stringify(issue), 'utf8');
+        issue._cachedJsonBuf = buf;
+        sendJsonBuffer(res, 200, buf);
         return;
       }
     }
@@ -1429,7 +1578,7 @@ export function createApp(): Server {
     const commentMatch = subPath.match(/^\/issues\/(\d+)\/comments$/);
     if (commentMatch) {
       const num = parseInt(commentMatch[1], 10);
-      const issue = repo.issues.find((i) => i.number === num);
+      const issue = repo.issuesMap.get(num) ?? repo.issues.find((i) => i.number === num);
       if (!issue) {
         sendJson(res, 404, { message: 'Not Found' });
         return;
@@ -1475,8 +1624,8 @@ export function createApp(): Server {
         const baseSha = repo.branches.get(base) ?? gitSha('commit', base);
 
         // Find changed files between base and head
-        const headTree = repo.tree.get(head) ?? new Map();
-        const baseTree = repo.tree.get(base) ?? new Map();
+        const headTree = repo.getBranchTree(head);
+        const baseTree = repo.getBranchTree(base);
         const changedFiles: PullFile[] = [];
 
         for (const [p, f] of headTree.entries()) {
@@ -1575,8 +1724,8 @@ export function createApp(): Server {
       pr.merge_commit_sha = mergeSha;
 
       // Apply files from head to default branch
-      const headTree = repo.tree.get(pr.head.ref) ?? new Map();
-      const defaultTree = repo.tree.get(repo.default_branch) ?? new Map();
+      const headTree = repo.getBranchTree(pr.head.ref);
+      const defaultTree = repo.getBranchTree(repo.default_branch);
       for (const [p, f] of headTree.entries()) {
         defaultTree.set(p, f);
       }

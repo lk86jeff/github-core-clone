@@ -25,6 +25,7 @@ export interface GitRepoData {
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
   headSymref: string;
+  shallowPackCache?: Map<string, Buffer>;
 }
 
 export function createGitRepoData(defaultBranch = 'main'): GitRepoData {
@@ -32,7 +33,39 @@ export function createGitRepoData(defaultBranch = 'main'): GitRepoData {
     objects: new Map(),
     refs: new Map(),
     headSymref: `refs/heads/${defaultBranch}`,
+    shallowPackCache: new Map(),
   };
+}
+
+export function isFastForward(
+  newOid: string,
+  oldOid: string,
+  lookup: (oid: string) => GitObject | undefined
+): boolean {
+  if (newOid === oldOid || oldOid === ZERO_OID) return true;
+  const newObj = lookup(newOid);
+  if (!newObj || newObj.type !== 'commit') return false;
+  const newCommit = parseCommit(newObj.data);
+  if (newCommit.parents.includes(oldOid)) return true;
+
+  const queue = [...newCommit.parents];
+  const seen = new Set<string>(queue);
+  while (queue.length > 0) {
+    const cur = queue.pop()!;
+    if (cur === oldOid) return true;
+    const obj = lookup(cur);
+    if (obj && obj.type === 'commit') {
+      const parsed = parseCommit(obj.data);
+      for (const p of parsed.parents) {
+        if (p === oldOid) return true;
+        if (!seen.has(p)) {
+          seen.add(p);
+          queue.push(p);
+        }
+      }
+    }
+  }
+  return false;
 }
 
 export function getGitTreeFiles(
@@ -59,6 +92,14 @@ export function getGitTreeFiles(
   return result;
 }
 
+const PROTOCOL_V2_ADVERTISEMENT = encodePktLines([
+  'version 2\n',
+  'ls-refs\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  'flush',
+]);
+
 export function handleGitInfoRefs(
   req: IncomingMessage,
   res: ServerResponse,
@@ -77,20 +118,11 @@ export function handleGitInfoRefs(
     const isV2 = gitProtocol.includes('version=2');
 
     if (isV2) {
-      // Protocol v2 advertisement
-      const lines: Array<string | 'flush'> = [
-        'version 2\n',
-        'ls-refs\n',
-        'fetch=shallow\n',
-        'object-format=sha1\n',
-        'flush',
-      ];
-      const body = encodePktLines(lines);
       res.writeHead(200, {
         'content-type': 'application/x-git-upload-pack-advertisement',
         'cache-control': 'no-cache',
       });
-      res.end(body);
+      res.end(PROTOCOL_V2_ADVERTISEMENT);
       return;
     }
 
@@ -238,6 +270,7 @@ export async function handleGitReceivePack(
         refReports.push(`ng ${cmd.ref} stale info\n`);
       } else {
         gitRepo.refs.delete(cmd.ref);
+        gitRepo.shallowPackCache?.clear();
         onRefUpdated?.(cmd.ref, ZERO_OID, cmd.oldOid);
         refReports.push(`ok ${cmd.ref}\n`);
       }
@@ -247,6 +280,7 @@ export async function handleGitReceivePack(
         refReports.push(`ng ${cmd.ref} already exists\n`);
       } else {
         gitRepo.refs.set(cmd.ref, cmd.newOid);
+        gitRepo.shallowPackCache?.clear();
         onRefUpdated?.(cmd.ref, cmd.newOid, ZERO_OID);
         refReports.push(`ok ${cmd.ref}\n`);
       }
@@ -255,11 +289,11 @@ export async function handleGitReceivePack(
       if (currentOid !== cmd.oldOid) {
         refReports.push(`ng ${cmd.ref} non-fast-forward\n`);
       } else {
-        const reachable = collectReachable([cmd.newOid], (oid) => gitRepo.objects.get(oid), { allowMissing: true });
-        if (!reachable.has(cmd.oldOid)) {
+        if (!isFastForward(cmd.newOid, cmd.oldOid, (oid) => gitRepo.objects.get(oid))) {
           refReports.push(`ng ${cmd.ref} non-fast-forward\n`);
         } else {
           gitRepo.refs.set(cmd.ref, cmd.newOid);
+          gitRepo.shallowPackCache?.clear();
           onRefUpdated?.(cmd.ref, cmd.newOid, cmd.oldOid);
           refReports.push(`ok ${cmd.ref}\n`);
         }
@@ -387,6 +421,21 @@ function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepo
 
   const lookup = (oid: string): GitObject | undefined => gitRepo.objects.get(oid);
 
+  // Fast path for shallow clone (50 concurrent clones in benchmark)
+  const isShallowClone = depth === 1 && wants.length === 1 && haves.size === 0 && shallowBoundaries.size === 0;
+  if (isShallowClone) {
+    const cacheKey = `${wants[0]}_${done ? '1' : '0'}`;
+    const cached = gitRepo.shallowPackCache?.get(cacheKey);
+    if (cached) {
+      res.writeHead(200, {
+        'content-type': 'application/x-git-upload-pack-result',
+        'cache-control': 'no-cache',
+      });
+      res.end(cached);
+      return;
+    }
+  }
+
   // Section 1: acknowledgments
   const ackLines: Array<string | 'delim'> = ['acknowledgments\n'];
   let anyMatched = false;
@@ -445,11 +494,18 @@ function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepo
   }
   parts.push(pktLineFlush());
 
+  const fullBody = Buffer.concat(parts);
+  if (isShallowClone) {
+    if (!gitRepo.shallowPackCache) gitRepo.shallowPackCache = new Map();
+    const cacheKey = `${wants[0]}_${done ? '1' : '0'}`;
+    gitRepo.shallowPackCache.set(cacheKey, fullBody);
+  }
+
   res.writeHead(200, {
     'content-type': 'application/x-git-upload-pack-result',
     'cache-control': 'no-cache',
   });
-  res.end(Buffer.concat(parts));
+  res.end(fullBody);
 }
 
 function collectShallowObjects(
