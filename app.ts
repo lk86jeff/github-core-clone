@@ -5,6 +5,7 @@ import {
   handleGitInfoRefs,
   handleGitUploadPack,
   handleGitReceivePack,
+  sendUploadPackV2Advertisement,
   getGitTreeFiles,
   ZERO_OID,
   parseCommit,
@@ -206,6 +207,20 @@ function sendNoContent(res: any): void {
   res.end();
 }
 
+/** First value of query param `name` in a raw query string, matching URLSearchParams.get. */
+function queryParam(qs: string, name: string): string | null {
+  const needle = `${name}=`;
+  let i = qs.indexOf(needle);
+  while (i !== -1) {
+    if (i === 0 || qs.charCodeAt(i - 1) === 38) {
+      const end = qs.indexOf('&', i + needle.length);
+      return qs.slice(i + needle.length, end === -1 ? undefined : end);
+    }
+    i = qs.indexOf(needle, i + 1);
+  }
+  return null;
+}
+
 function parseBody(req: any): Promise<any> {
   if (req._body && Buffer.isBuffer(req._body)) {
     const str = req._body.toString('utf8');
@@ -296,8 +311,18 @@ export function createApp(): any {
           res.end('Repository not found\n');
           return;
         }
-        const parsedUrl = new URL(rawUrl, 'http://127.0.0.1');
-        handleGitInfoRefs(req, res, repo.gitRepo, parsedUrl);
+        const service = queryParam(qIdx === -1 ? '' : rawUrl.slice(qIdx + 1), 'service');
+        if (
+          service === 'git-upload-pack' &&
+          ((req.headers['git-protocol'] as string | undefined) ?? '').includes('version=2')
+        ) {
+          sendUploadPackV2Advertisement(res);
+          return;
+        }
+        const fakeUrl = {
+          searchParams: { get: (k: string) => (k === 'service' ? service : null) },
+        } as unknown as URL;
+        handleGitInfoRefs(req, res, repo.gitRepo, fakeUrl);
         return;
       }
     }

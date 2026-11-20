@@ -68,7 +68,8 @@ export class RawServerResponse {
   }
 
   cork(): void {
-    this.socket.cork();
+    // Kept for callers; end() writes head+body as one buffer in a single write,
+    // so corking buys nothing and uncork bookkeeping would only cost syscalls.
   }
 
   setHeader(name: string, value: string | number): this {
@@ -115,9 +116,6 @@ export class RawServerResponse {
     ) {
       this.headers['content-length'] = bodyLen;
     }
-    if (this.headers['connection'] === undefined) {
-      this.headers['connection'] = 'keep-alive';
-    }
 
     const statusText = STATUS_TEXT[this.statusCode] ?? 'OK';
     let head = `HTTP/1.1 ${this.statusCode} ${statusText}\r\n`;
@@ -126,15 +124,29 @@ export class RawServerResponse {
     }
     head += '\r\n';
 
-    const headBuf = Buffer.from(head, 'latin1');
-    this.socket.write(headBuf);
-    if (bodyBuf && bodyBuf.length > 0) {
-      this.socket.write(bodyBuf);
+    // One buffer, one write: syscalls are the expensive part under gVisor.
+    const headLen = Buffer.byteLength(head, 'latin1');
+    const out = Buffer.allocUnsafe(headLen + bodyLen);
+    out.write(head, 0, headLen, 'latin1');
+    if (bodyBuf && bodyLen > 0) {
+      bodyBuf.copy(out, headLen);
     }
-    while (this.socket.writableCorked > 0) {
-      this.socket.uncork();
-    }
+    this.socket.write(out);
 
+    if (this.onEnd) {
+      this.onEnd();
+    }
+    return this;
+  }
+
+  /**
+   * Write a fully prebuilt HTTP response (status line + headers + body) in one
+   * socket write. The buffer must already carry its own content-length.
+   */
+  endRaw(full: Buffer): this {
+    if (this.headersSent) return this;
+    this.headersSent = true;
+    this.socket.write(full);
     if (this.onEnd) {
       this.onEnd();
     }
