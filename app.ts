@@ -229,6 +229,16 @@ export function createApp(): Server {
     const qIdx = rawUrl.indexOf('?');
     const path = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
 
+    let _lazyUrl: URL | undefined;
+    const parsedUrl = {
+      get searchParams() {
+        return (_lazyUrl ??= new URL(rawUrl, 'http://127.0.0.1')).searchParams;
+      },
+      get pathname() {
+        return path;
+      },
+    };
+
     // Fast path: GET /api/v3/repos/:owner/:repo/issues/:num (the 2000-call 'read' benchmark)
     if (method === 'GET' && path.charCodeAt(0) === 47 && path.startsWith('/api/v3/repos/')) {
       const rest = path.slice(14); // after '/api/v3/repos/'
