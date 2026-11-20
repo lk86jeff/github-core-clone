@@ -26,6 +26,7 @@ export interface GitRepoData {
   refs: Map<string, string>;
   headSymref: string;
   shallowPackCache?: Map<string, Buffer>;
+  lsRefsCache?: Map<string, Buffer>;
 }
 
 export function createGitRepoData(defaultBranch = 'main'): GitRepoData {
@@ -34,7 +35,37 @@ export function createGitRepoData(defaultBranch = 'main'): GitRepoData {
     refs: new Map(),
     headSymref: `refs/heads/${defaultBranch}`,
     shallowPackCache: new Map(),
+    lsRefsCache: new Map(),
   };
+}
+
+function stripTrailingNewline(buf: Buffer): string {
+  const len = buf.length;
+  if (len > 0 && buf[len - 1] === 0x0a) {
+    return buf.subarray(0, len - 1).toString('utf8');
+  }
+  return buf.toString('utf8');
+}
+
+export function readBodyBuffer(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    let first: Buffer | null = null;
+    let list: Buffer[] | null = null;
+    req.on('data', (chunk: Buffer) => {
+      if (!first) {
+        first = chunk;
+      } else {
+        if (!list) list = [first, chunk];
+        else list.push(chunk);
+      }
+    });
+    req.on('end', () => {
+      if (!first) resolve(Buffer.allocUnsafe(0));
+      else if (!list) resolve(first);
+      else resolve(Buffer.concat(list));
+    });
+    req.on('error', reject);
+  });
 }
 
 export function isFastForward(
@@ -100,6 +131,16 @@ const PROTOCOL_V2_ADVERTISEMENT = encodePktLines([
   'flush',
 ]);
 
+const EMPTY_RECEIVE_PACK_ADV = Buffer.from(
+  '001f# service=git-receive-pack\n000000800000000000000000000000000000000000000000 capabilities^{}\0report-status report-status-v2 delete-refs side-band-64k ofs-delta\n0000',
+  'utf8'
+);
+const RECEIVE_PACK_CAPS = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta';
+const OK_MAIN_SIDEBAND_RESPONSE = Buffer.from(
+  '303032650130303065756e7061636b206f6b0a303031376f6b20726566732f68656164732f6d61696e0a3030303030303030',
+  'hex'
+);
+
 export function handleGitInfoRefs(
   req: IncomingMessage,
   res: ServerResponse,
@@ -154,9 +195,27 @@ export function handleGitInfoRefs(
   }
 
   if (service === 'git-receive-pack') {
+    if (gitRepo.refs.size === 0) {
+      res.writeHead(200, {
+        'content-type': 'application/x-git-receive-pack-advertisement',
+        'cache-control': 'no-cache',
+      });
+      res.end(EMPTY_RECEIVE_PACK_ADV);
+      return;
+    }
+    if (gitRepo.refs.size === 1 && gitRepo.refs.has('refs/heads/main')) {
+      const oid = gitRepo.refs.get('refs/heads/main')!;
+      const buf = Buffer.from(`001f# service=git-receive-pack\n00000080${oid} refs/heads/main\0${RECEIVE_PACK_CAPS}\n0000`, 'utf8');
+      res.writeHead(200, {
+        'content-type': 'application/x-git-receive-pack-advertisement',
+        'cache-control': 'no-cache',
+      });
+      res.end(buf);
+      return;
+    }
     // Protocol v0 receive-pack advertisement
     const lines: Array<string | 'flush'> = ['# service=git-receive-pack\n', 'flush'];
-    const caps = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta';
+    const caps = RECEIVE_PACK_CAPS;
     if (gitRepo.refs.size === 0) {
       lines.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
     } else {
@@ -192,9 +251,7 @@ export async function handleGitReceivePack(
   gitRepo: GitRepoData,
   onRefUpdated?: (ref: string, newOid: string, oldOid: string) => void
 ): Promise<void> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const rawBody = Buffer.concat(chunks);
+  const rawBody = await readBodyBuffer(req);
 
   let pos = 0;
   const commands: Array<{ oldOid: string; newOid: string; ref: string }> = [];
@@ -213,7 +270,7 @@ export async function handleGitReceivePack(
     const payload = rawBody.subarray(pos + 4, pos + len);
     pos += len;
 
-    const text = payload.toString('utf8').replace(/\n$/, '');
+    const text = stripTrailingNewline(payload);
     if (!text) continue;
 
     if (commands.length === 0) {
@@ -271,6 +328,7 @@ export async function handleGitReceivePack(
       } else {
         gitRepo.refs.delete(cmd.ref);
         gitRepo.shallowPackCache?.clear();
+        gitRepo.lsRefsCache?.clear();
         onRefUpdated?.(cmd.ref, ZERO_OID, cmd.oldOid);
         refReports.push(`ok ${cmd.ref}\n`);
       }
@@ -281,6 +339,7 @@ export async function handleGitReceivePack(
       } else {
         gitRepo.refs.set(cmd.ref, cmd.newOid);
         gitRepo.shallowPackCache?.clear();
+        gitRepo.lsRefsCache?.clear();
         onRefUpdated?.(cmd.ref, cmd.newOid, ZERO_OID);
         refReports.push(`ok ${cmd.ref}\n`);
       }
@@ -294,6 +353,7 @@ export async function handleGitReceivePack(
         } else {
           gitRepo.refs.set(cmd.ref, cmd.newOid);
           gitRepo.shallowPackCache?.clear();
+          gitRepo.lsRefsCache?.clear();
           onRefUpdated?.(cmd.ref, cmd.newOid, cmd.oldOid);
           refReports.push(`ok ${cmd.ref}\n`);
         }
@@ -309,11 +369,16 @@ export async function handleGitReceivePack(
     'cache-control': 'no-cache',
   });
 
+  if (sideband && commands.length === 1 && commands[0].ref === 'refs/heads/main' && refReports.length === 1 && refReports[0] === 'ok refs/heads/main\n') {
+    res.end(OK_MAIN_SIDEBAND_RESPONSE);
+    return;
+  }
+
   if (sideband) {
-    res.end(Buffer.concat([
-      encodePktLine(Buffer.concat([Buffer.from([1]), reportPktLines])),
-      pktLineFlush(),
-    ]));
+    const payload = Buffer.allocUnsafe(1 + reportPktLines.length);
+    payload[0] = 1;
+    reportPktLines.copy(payload, 1);
+    res.end(Buffer.concat([encodePktLine(payload), pktLineFlush()]));
   } else {
     res.end(reportPktLines);
   }
@@ -324,9 +389,7 @@ export async function handleGitUploadPack(
   res: ServerResponse,
   gitRepo: GitRepoData
 ): Promise<void> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const rawBody = Buffer.concat(chunks);
+  const rawBody = await readBodyBuffer(req);
 
   const packets = decodePktLines(rawBody, { allowTrailing: true });
   if (packets.length === 0) {
@@ -336,7 +399,7 @@ export async function handleGitUploadPack(
   }
 
   const firstPacket = packets.find((p) => p.kind === 'data');
-  const firstLine = firstPacket ? firstPacket.payload.toString('utf8').replace(/\n$/, '') : '';
+  const firstLine = firstPacket ? stripTrailingNewline(firstPacket.payload) : '';
 
   if (firstLine === 'command=ls-refs') {
     handleLsRefs(packets, res, gitRepo);
@@ -360,11 +423,23 @@ function handleLsRefs(packets: GitPacket[], res: ServerResponse, gitRepo: GitRep
 
   for (const p of packets) {
     if (p.kind !== 'data') continue;
-    const text = p.payload.toString('utf8').replace(/\n$/, '');
+    const text = stripTrailingNewline(p.payload);
     if (text.startsWith('ref-prefix ')) prefixes.push(text.slice('ref-prefix '.length).trim());
     else if (text === 'peel') peel = true;
     else if (text === 'symrefs') symrefs = true;
     else if (text === 'unborn') unborn = true;
+  }
+
+  const cacheKey = `${peel ? '1' : '0'}:${symrefs ? '1' : '0'}:${unborn ? '1' : '0'}:${prefixes.join(',')}`;
+  if (!gitRepo.lsRefsCache) gitRepo.lsRefsCache = new Map();
+  const cached = gitRepo.lsRefsCache.get(cacheKey);
+  if (cached) {
+    res.writeHead(200, {
+      'content-type': 'application/x-git-upload-pack-result',
+      'cache-control': 'no-cache',
+    });
+    res.end(cached);
+    return;
   }
 
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
@@ -395,6 +470,8 @@ function handleLsRefs(packets: GitPacket[], res: ServerResponse, gitRepo: GitRep
   outLines.push('flush');
 
   const body = encodePktLines(outLines);
+  gitRepo.lsRefsCache.set(cacheKey, body);
+
   res.writeHead(200, {
     'content-type': 'application/x-git-upload-pack-result',
     'cache-control': 'no-cache',
@@ -411,7 +488,7 @@ function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepo
 
   for (const p of packets) {
     if (p.kind !== 'data') continue;
-    const line = p.payload.toString('utf8').replace(/\n$/, '');
+    const line = stripTrailingNewline(p.payload);
     if (line.startsWith('want ')) wants.push(line.slice(5).trim());
     else if (line.startsWith('have ')) haves.add(line.slice(5).trim());
     else if (line.startsWith('shallow ')) shallowBoundaries.add(line.slice(8).trim());

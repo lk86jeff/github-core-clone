@@ -8,6 +8,7 @@ import {
   getGitTreeFiles,
   ZERO_OID,
   parseCommit,
+  readBodyBuffer,
   type GitRepoData,
 } from './git-handler.ts';
 
@@ -204,12 +205,7 @@ function sendNoContent(res: ServerResponse): void {
 }
 
 async function parseBody(req: IncomingMessage): Promise<any> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(chunk as Buffer);
-  }
-  if (chunks.length === 0) return {};
-  const buf = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+  const buf = await readBodyBuffer(req);
   if (buf.length === 0) return {};
   const str = buf.toString('utf8');
   if (!str.trim()) return {};
@@ -283,16 +279,41 @@ export function createApp(): Server {
     }
 
     // Git Smart-HTTP endpoints: /{owner}/{repo}(.git)/...
-    let gitMatch: RegExpMatchArray | null = null;
-    if (path.endsWith('/git-upload-pack') || path.endsWith('/git-receive-pack') || path.endsWith('/info/refs')) {
-      gitMatch = path.match(/^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)$/);
-    }
-    if (gitMatch) {
-      const owner = gitMatch[1];
-      const repoName = gitMatch[2];
-      const gitServicePath = gitMatch[3];
+    let gitOwner = '';
+    let gitRepoName = '';
+    let gitServicePath = '';
 
-      const repo = store.getRepo(owner, repoName);
+    if (path.endsWith('/git-upload-pack')) {
+      gitServicePath = 'git-upload-pack';
+      const prefix = path.slice(1, -16);
+      const s = prefix.indexOf('/');
+      if (s !== -1) {
+        gitOwner = prefix.slice(0, s);
+        gitRepoName = prefix.slice(s + 1);
+        if (gitRepoName.endsWith('.git')) gitRepoName = gitRepoName.slice(0, -4);
+      }
+    } else if (path.endsWith('/git-receive-pack')) {
+      gitServicePath = 'git-receive-pack';
+      const prefix = path.slice(1, -17);
+      const s = prefix.indexOf('/');
+      if (s !== -1) {
+        gitOwner = prefix.slice(0, s);
+        gitRepoName = prefix.slice(s + 1);
+        if (gitRepoName.endsWith('.git')) gitRepoName = gitRepoName.slice(0, -4);
+      }
+    } else if (path.endsWith('/info/refs')) {
+      gitServicePath = 'info/refs';
+      const prefix = path.slice(1, -10);
+      const s = prefix.indexOf('/');
+      if (s !== -1) {
+        gitOwner = prefix.slice(0, s);
+        gitRepoName = prefix.slice(s + 1);
+        if (gitRepoName.endsWith('.git')) gitRepoName = gitRepoName.slice(0, -4);
+      }
+    }
+
+    if (gitServicePath !== '') {
+      const repo = store.getRepo(gitOwner, gitRepoName);
       if (!repo) {
         res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
         res.end('Repository not found\n');
@@ -1254,13 +1275,21 @@ export function createApp(): Server {
     }
 
     // Repository match: /api/v3/repos/:owner/:repo
-    const repoMatch = path.match(/^\/api\/v3\/repos\/([^\/]+)\/([^\/]+)(.*)$/);
-    if (!repoMatch) {
+    if (!path.startsWith('/api/v3/repos/')) {
       sendJson(res, 404, { message: 'Not Found' });
       return;
     }
 
-    const [, owner, repoName, subPath] = repoMatch;
+    const repoRest = path.slice(14); // after '/api/v3/repos/'
+    const slash1 = repoRest.indexOf('/');
+    if (slash1 === -1) {
+      sendJson(res, 404, { message: 'Not Found' });
+      return;
+    }
+    const owner = repoRest.slice(0, slash1);
+    const slash2 = repoRest.indexOf('/', slash1 + 1);
+    const repoName = slash2 === -1 ? repoRest.slice(slash1 + 1) : repoRest.slice(slash1 + 1, slash2);
+    const subPath = slash2 === -1 ? '' : repoRest.slice(slash2);
     const repo = store.getRepo(owner, repoName);
 
     // Repos not found
@@ -1351,9 +1380,8 @@ export function createApp(): Server {
     }
 
     // Contents: /api/v3/repos/:owner/:repo/contents/:path*
-    const contentsMatch = subPath.match(/^\/contents\/(.+)$/);
-    if (contentsMatch) {
-      const filePath = contentsMatch[1];
+    if (subPath.startsWith('/contents/') && subPath.length > 10) {
+      const filePath = subPath.slice(10);
       const branch = parsedUrl.searchParams.get('ref') ?? body?.branch ?? repo.default_branch;
       const branchTree = repo.getBranchTree(branch);
 
@@ -1546,74 +1574,79 @@ export function createApp(): Server {
       }
     }
 
-    // Single Issue: /api/v3/repos/:owner/:repo/issues/:number
-    const issueMatch = subPath.match(/^\/issues\/(\d+)$/);
-    if (issueMatch) {
-      const num = parseInt(issueMatch[1], 10);
-      const issue = repo.issuesMap.get(num) ?? repo.issues.find((i) => i.number === num);
-      if (!issue) {
-        sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
+    // Single Issue or Comments: /api/v3/repos/:owner/:repo/issues/:number...
+    if (subPath.startsWith('/issues/')) {
+      const subIssues = subPath.slice(8);
+      const slashAfter = subIssues.indexOf('/');
+      if (slashAfter === -1) {
+        // Single Issue: /api/v3/repos/:owner/:repo/issues/:number
+        const num = parseInt(subIssues, 10);
+        if (!isNaN(num)) {
+          const issue = repo.issuesMap.get(num) ?? repo.issues.find((i) => i.number === num);
+          if (!issue) {
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
 
-      if (method === 'GET') {
-        if (issue._cachedJsonBuf) {
-          sendJsonBuffer(res, 200, issue._cachedJsonBuf);
-        } else {
-          const buf = Buffer.from(JSON.stringify(issue), 'utf8');
-          issue._cachedJsonBuf = buf;
-          sendJsonBuffer(res, 200, buf);
-        }
-        return;
-      }
+          if (method === 'GET') {
+            if (issue._cachedJsonBuf) {
+              sendJsonBuffer(res, 200, issue._cachedJsonBuf);
+            } else {
+              const buf = Buffer.from(JSON.stringify(issue), 'utf8');
+              issue._cachedJsonBuf = buf;
+              sendJsonBuffer(res, 200, buf);
+            }
+            return;
+          }
 
-      if (method === 'PATCH') {
-        if (body?.state) {
-          issue.state = body.state;
-          if (body.state === 'closed') {
-            issue.closed_at = new Date().toISOString();
+          if (method === 'PATCH') {
+            if (body?.state) {
+              issue.state = body.state;
+              if (body.state === 'closed') {
+                issue.closed_at = new Date().toISOString();
+              }
+            }
+            if (body?.title) issue.title = body.title;
+            if (body?.body !== undefined) issue.body = body.body;
+            issue.updated_at = new Date().toISOString();
+            const buf = Buffer.from(JSON.stringify(issue), 'utf8');
+            issue._cachedJsonBuf = buf;
+            sendJsonBuffer(res, 200, buf);
+            return;
           }
         }
-        if (body?.title) issue.title = body.title;
-        if (body?.body !== undefined) issue.body = body.body;
-        issue.updated_at = new Date().toISOString();
-        const buf = Buffer.from(JSON.stringify(issue), 'utf8');
-        issue._cachedJsonBuf = buf;
-        sendJsonBuffer(res, 200, buf);
-        return;
-      }
-    }
+      } else if (subIssues.slice(slashAfter) === '/comments') {
+        // Issue Comments: /api/v3/repos/:owner/:repo/issues/:number/comments
+        const num = parseInt(subIssues.slice(0, slashAfter), 10);
+        if (!isNaN(num)) {
+          const issue = repo.issuesMap.get(num) ?? repo.issues.find((i) => i.number === num);
+          if (!issue) {
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
 
-    // Issue Comments: /api/v3/repos/:owner/:repo/issues/:number/comments
-    const commentMatch = subPath.match(/^\/issues\/(\d+)\/comments$/);
-    if (commentMatch) {
-      const num = parseInt(commentMatch[1], 10);
-      const issue = repo.issuesMap.get(num) ?? repo.issues.find((i) => i.number === num);
-      if (!issue) {
-        sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
+          if (method === 'GET') {
+            sendJson(res, 200, issue.comments);
+            return;
+          }
 
-      if (method === 'GET') {
-        sendJson(res, 200, issue.comments);
-        return;
-      }
-
-      if (method === 'POST') {
-        const cBody = body?.body;
-        if (!cBody) {
-          sendJson(res, 422, { message: 'Body required' });
-          return;
+          if (method === 'POST') {
+            const cBody = body?.body;
+            if (!cBody) {
+              sendJson(res, 422, { message: 'Body required' });
+              return;
+            }
+            const commentObj: IssueComment = {
+              id: store.nextId++,
+              body: cBody,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            };
+            issue.comments.push(commentObj);
+            sendJson(res, 201, commentObj);
+            return;
+          }
         }
-        const commentObj: IssueComment = {
-          id: store.nextId++,
-          body: cBody,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        };
-        issue.comments.push(commentObj);
-        sendJson(res, 201, commentObj);
-        return;
       }
     }
 
@@ -1678,85 +1711,95 @@ export function createApp(): Server {
       }
     }
 
-    // Single Pull Request: /api/v3/repos/:owner/:repo/pulls/:number
-    const pullMatch = subPath.match(/^\/pulls\/(\d+)$/);
-    if (pullMatch) {
-      const num = parseInt(pullMatch[1], 10);
-      const pr = repo.pulls.find((p) => p.number === num);
-      if (!pr) {
-        sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
-      if (method === 'GET') {
-        sendJson(res, 200, pr);
-        return;
-      }
-    }
+    // Pull Requests: /api/v3/repos/:owner/:repo/pulls/:number...
+    if (subPath.startsWith('/pulls/')) {
+      const subPulls = subPath.slice(7);
+      const slashAfter = subPulls.indexOf('/');
+      if (slashAfter === -1) {
+        // Single Pull Request: /api/v3/repos/:owner/:repo/pulls/:number
+        const num = parseInt(subPulls, 10);
+        if (!isNaN(num)) {
+          const pr = repo.pulls.find((p) => p.number === num);
+          if (!pr) {
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
+          if (method === 'GET') {
+            sendJson(res, 200, pr);
+            return;
+          }
+        }
+      } else if (subPulls.slice(slashAfter) === '/files') {
+        // Pull Files: /api/v3/repos/:owner/:repo/pulls/:number/files
+        const num = parseInt(subPulls.slice(0, slashAfter), 10);
+        if (!isNaN(num)) {
+          const pr = repo.pulls.find((p) => p.number === num);
+          if (!pr) {
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
+          sendJson(res, 200, pr.files);
+          return;
+        }
+      } else if (subPulls.slice(slashAfter) === '/merge' && method === 'PUT') {
+        // Pull Merge: PUT /api/v3/repos/:owner/:repo/pulls/:number/merge
+        const num = parseInt(subPulls.slice(0, slashAfter), 10);
+        if (!isNaN(num)) {
+          const pr = repo.pulls.find((p) => p.number === num);
+          if (!pr) {
+            sendJson(res, 404, { message: 'Not Found' });
+            return;
+          }
+          if (pr.merged) {
+            sendJson(res, 405, { message: 'Pull Request is already merged' });
+            return;
+          }
 
-    // Pull Files: /api/v3/repos/:owner/:repo/pulls/:number/files
-    const pullFilesMatch = subPath.match(/^\/pulls\/(\d+)\/files$/);
-    if (pullFilesMatch) {
-      const num = parseInt(pullFilesMatch[1], 10);
-      const pr = repo.pulls.find((p) => p.number === num);
-      if (!pr) {
-        sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
-      sendJson(res, 200, pr.files);
-      return;
-    }
+          // Check if base branch tip has advanced past pr.base.sha
+          const currentBaseSha = repo.branches.get(pr.base.ref);
+          if (currentBaseSha && currentBaseSha !== pr.base.sha) {
+            sendJson(res, 405, { message: 'Pull Request is not mergeable' });
+            return;
+          }
 
-    // Pull Merge: PUT /api/v3/repos/:owner/:repo/pulls/:number/merge
-    const pullMergeMatch = subPath.match(/^\/pulls\/(\d+)\/merge$/);
-    if (pullMergeMatch && method === 'PUT') {
-      const num = parseInt(pullMergeMatch[1], 10);
-      const pr = repo.pulls.find((p) => p.number === num);
-      if (!pr) {
-        sendJson(res, 404, { message: 'Not Found' });
-        return;
-      }
-      if (pr.merged) {
-        sendJson(res, 405, { message: 'Pull Request is already merged' });
-        return;
-      }
+          const mergeSha = gitSha('commit', `squash merge PR #${num}`);
+          pr.merged = true;
+          pr.state = 'closed';
+          pr.merged_at = new Date().toISOString();
+          pr.merge_commit_sha = mergeSha;
 
-      // Check if base branch tip has advanced past pr.base.sha
-      const currentBaseSha = repo.branches.get(pr.base.ref);
-      if (currentBaseSha && currentBaseSha !== pr.base.sha) {
-        sendJson(res, 405, { message: 'Pull Request is not mergeable' });
-        return;
+          // Apply files from head to default branch
+          const headTree = repo.getBranchTree(pr.head.ref);
+          const defaultTree = repo.getBranchTree(repo.default_branch);
+          for (const [p, f] of headTree.entries()) {
+            defaultTree.set(p, f);
+          }
+          repo.tree.set(repo.default_branch, defaultTree);
+          repo.branches.set(repo.default_branch, mergeSha);
+          repo.commits.set(mergeSha, {
+            sha: mergeSha,
+            message: body?.commit_message ?? `Squash commit #${num}`,
+            branch: repo.default_branch,
+            files: new Map(defaultTree),
+          });
+
+          sendJson(res, 200, {
+            sha: mergeSha,
+            merged: true,
+            message: 'Pull Request successfully merged',
+          });
+          return;
+        }
       }
-
-      const mergeSha = gitSha('commit', `squash merge PR #${num}`);
-      pr.merged = true;
-      pr.state = 'closed';
-      pr.merged_at = new Date().toISOString();
-      pr.merge_commit_sha = mergeSha;
-
-      // Apply files from head to default branch
-      const headTree = repo.getBranchTree(pr.head.ref);
-      const defaultTree = repo.getBranchTree(repo.default_branch);
-      for (const [p, f] of headTree.entries()) {
-        defaultTree.set(p, f);
-      }
-      repo.tree.set(repo.default_branch, defaultTree);
-      repo.branches.set(repo.default_branch, mergeSha);
-      repo.commits.set(mergeSha, {
-        sha: mergeSha,
-        message: body?.commit_message ?? `Squash commit #${num}`,
-        branch: repo.default_branch,
-        files: new Map(defaultTree),
-      });
-
-      sendJson(res, 200, {
-        sha: mergeSha,
-        merged: true,
-        message: 'Pull Request successfully merged',
-      });
-      return;
     }
 
     // Fallback 404
     sendJson(res, 404, { message: 'Not Found' });
   });
+
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+
+  return server;
 }
