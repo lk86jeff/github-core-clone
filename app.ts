@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createRawHttpServer, setFastReadCache, clearFastReadCache } from './raw-server.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   createGitRepoData,
@@ -184,7 +184,7 @@ function sendJson(
 }
 
 function sendJsonBuffer(
-  res: ServerResponse,
+  res: any,
   status: number,
   buf: Buffer,
   headers: Readonly<Record<string, string>> = {}
@@ -199,14 +199,14 @@ function sendJsonBuffer(
   res.end(buf);
 }
 
-function sendNoContent(res: ServerResponse): void {
+function sendNoContent(res: any): void {
   res.writeHead(204, {
     'x-github-request-id': (reqIdCounter++).toString(16),
   });
   res.end();
 }
 
-async function parseBody(req: IncomingMessage): Promise<any> {
+async function parseBody(req: any): Promise<any> {
   const buf = await readBodyBuffer(req);
   if (buf.length === 0) return {};
   const str = buf.toString('utf8');
@@ -218,13 +218,13 @@ async function parseBody(req: IncomingMessage): Promise<any> {
   }
 }
 
-export function createApp(): Server {
+export function createApp(): any {
   const store = new ForgeStore();
   let lastReadPath = '';
   let lastReadBuf: Buffer | null = null;
   let lastReadHeaders: Record<string, string | number> | null = null;
 
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createRawHttpServer((req: any, res: any) => {
     const method = req.method ?? 'GET';
     const rawUrl = req.url ?? '/';
     const qIdx = rawUrl.indexOf('?');
@@ -262,13 +262,8 @@ export function createApp(): Server {
               }
               const buf = issue._cachedJsonBuf ?? Buffer.from(JSON.stringify(issue), 'utf8');
               issue._cachedJsonBuf = buf;
-              lastReadPath = path;
-              lastReadBuf = buf;
-              lastReadHeaders = {
-                'content-type': JSON_TYPE,
-                'content-length': buf.length,
-                'x-github-request-id': 'forge-read',
-              };
+              const head = `HTTP/1.1 200 OK\r\ncontent-type: ${JSON_TYPE}\r\ncontent-length: ${buf.length}\r\nconnection: keep-alive\r\nx-github-request-id: forge-read\r\n\r\n`;
+              setFastReadCache(path, Buffer.concat([Buffer.from(head, 'latin1'), buf]));
               sendJsonBuffer(res, 200, buf);
               return;
             }
@@ -377,6 +372,7 @@ export function createApp(): Server {
           issue._cachedJsonBuf = issueBuf;
           repo.issues.push(issue);
           repo.issuesMap.set(num, issue);
+          clearFastReadCache();
           lastReadPath = '';
           lastReadBuf = null;
           lastReadHeaders = null;
@@ -1659,6 +1655,7 @@ export function createApp(): Server {
             issue.updated_at = new Date().toISOString();
             const buf = Buffer.from(JSON.stringify(issue), 'utf8');
             issue._cachedJsonBuf = buf;
+            clearFastReadCache();
             lastReadPath = '';
             lastReadBuf = null;
             lastReadHeaders = null;

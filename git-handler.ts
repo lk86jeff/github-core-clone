@@ -47,7 +47,8 @@ function stripTrailingNewline(buf: Buffer): string {
   return buf.toString('utf8');
 }
 
-export function readBodyBuffer(req: IncomingMessage): Promise<Buffer> {
+export function readBodyBuffer(req: any): Promise<Buffer> {
+  if (req._body !== undefined) return Promise.resolve(req._body);
   return new Promise((resolve, reject) => {
     let first: Buffer | null = null;
     let list: Buffer[] | null = null;
