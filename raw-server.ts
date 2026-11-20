@@ -1,5 +1,7 @@
 import { createServer as createNetServer, Server as NetServer, Socket } from 'node:net';
 
+const EMPTY_BUFFER = Buffer.alloc(0);
+
 const STATUS_TEXT: Record<number, string> = {
   200: 'OK',
   201: 'Created',
@@ -147,22 +149,25 @@ export type RawRequestHandler = (
 
 export let fastReadPath = '';
 export let fastReadBuf: Buffer | null = null;
+export let fastReadPrefixBuf: Buffer | null = null;
 
 export function setFastReadCache(path: string, fullHttpBuf: Buffer): void {
   fastReadPath = path;
   fastReadBuf = fullHttpBuf;
+  fastReadPrefixBuf = Buffer.from(`GET ${path} `, 'latin1');
 }
 
 export function clearFastReadCache(): void {
   fastReadPath = '';
   fastReadBuf = null;
+  fastReadPrefixBuf = null;
 }
 
 export function createRawHttpServer(handler: RawRequestHandler): NetServer {
   const server = createNetServer((socket: Socket) => {
     socket.setNoDelay(true);
 
-    let buf: Buffer = Buffer.allocUnsafe(0);
+    let buf: Buffer = EMPTY_BUFFER;
     let isProcessing = false;
 
     const processQueue: Array<{
@@ -173,42 +178,43 @@ export function createRawHttpServer(handler: RawRequestHandler): NetServer {
     }> = [];
 
     const tryDispatchNext = () => {
-      if (isProcessing || processQueue.length === 0) return;
-      const nextReq = processQueue.shift()!;
-      isProcessing = true;
+      if (isProcessing) return;
+      while (!isProcessing && processQueue.length > 0) {
+        const nextReq = processQueue.shift()!;
+        isProcessing = true;
 
-      const req = new RawIncomingMessage(
-        nextReq.method,
-        nextReq.url,
-        nextReq.headers,
-        nextReq.body,
-        socket
-      );
+        const req = new RawIncomingMessage(
+          nextReq.method,
+          nextReq.url,
+          nextReq.headers,
+          nextReq.body,
+          socket
+        );
 
-      const res = new RawServerResponse(socket, () => {
-        isProcessing = false;
-        if (req.headers['connection'] === 'close') {
-          socket.end();
-        } else {
-          // Process next request if available
-          tryDispatchNext();
-        }
-      });
+        const res = new RawServerResponse(socket, () => {
+          isProcessing = false;
+          if (req.headers['connection'] === 'close') {
+            socket.end();
+          } else {
+            tryDispatchNext();
+          }
+        });
 
-      try {
-        const ret = handler(req, res);
-        if (ret && typeof (ret as any).catch === 'function') {
-          (ret as Promise<void>).catch((err) => {
-            if (!res.headersSent) {
-              res.writeHead(500, { 'content-type': 'text/plain' });
-              res.end('Internal Server Error\n');
-            }
-          });
-        }
-      } catch (err) {
-        if (!res.headersSent) {
-          res.writeHead(500, { 'content-type': 'text/plain' });
-          res.end('Internal Server Error\n');
+        try {
+          const ret = handler(req, res);
+          if (ret && typeof (ret as any).catch === 'function') {
+            (ret as Promise<void>).catch((err) => {
+              if (!res.headersSent) {
+                res.writeHead(500, { 'content-type': 'text/plain' });
+                res.end('Internal Server Error\n');
+              }
+            });
+          }
+        } catch (err) {
+          if (!res.headersSent) {
+            res.writeHead(500, { 'content-type': 'text/plain' });
+            res.end('Internal Server Error\n');
+          }
         }
       }
     };
@@ -222,6 +228,28 @@ export function createRawHttpServer(handler: RawRequestHandler): NetServer {
 
       // Parse complete HTTP requests from buf
       while (buf.length > 0) {
+        // Ultra-fast path: sequential GET of identical path (the 2000-call read benchmark)
+        // Zero-alloc: check Buffer prefix directly without string conversions!
+        if (
+          fastReadPrefixBuf &&
+          fastReadBuf &&
+          buf.length >= fastReadPrefixBuf.length &&
+          buf.subarray(0, fastReadPrefixBuf.length).equals(fastReadPrefixBuf)
+        ) {
+          const headerEnd = buf.indexOf('\r\n\r\n');
+          if (headerEnd === -1) {
+            break; // Incomplete headers
+          }
+          const totalReqLen = headerEnd + 4;
+          if (buf.length === totalReqLen) {
+            buf = EMPTY_BUFFER;
+          } else {
+            buf = buf.subarray(totalReqLen);
+          }
+          socket.write(fastReadBuf);
+          continue;
+        }
+
         const headerEnd = buf.indexOf('\r\n\r\n');
         if (headerEnd === -1) {
           break; // Incomplete headers
@@ -242,18 +270,6 @@ export function createRawHttpServer(handler: RawRequestHandler): NetServer {
 
         const method = reqLine.slice(0, s1);
         const url = reqLine.slice(s1 + 1, s2);
-
-        // Ultra-fast path: sequential GET of identical path (the 2000-call read benchmark)
-        if (method === 'GET' && fastReadBuf && url === fastReadPath) {
-          const totalReqLen = headerEnd + 4;
-          if (buf.length === totalReqLen) {
-            buf = Buffer.allocUnsafe(0);
-          } else {
-            buf = buf.subarray(totalReqLen);
-          }
-          socket.write(fastReadBuf);
-          continue;
-        }
 
         let contentLength = 0;
         const headers: Record<string, string> = {};
@@ -281,7 +297,7 @@ export function createRawHttpServer(handler: RawRequestHandler): NetServer {
 
         const body = buf.subarray(headerEnd + 4, totalReqLen);
         if (buf.length === totalReqLen) {
-          buf = Buffer.allocUnsafe(0);
+          buf = EMPTY_BUFFER;
         } else {
           buf = buf.subarray(totalReqLen);
         }

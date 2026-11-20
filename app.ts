@@ -206,16 +206,26 @@ function sendNoContent(res: any): void {
   res.end();
 }
 
-async function parseBody(req: any): Promise<any> {
-  const buf = await readBodyBuffer(req);
-  if (buf.length === 0) return {};
-  const str = buf.toString('utf8');
-  if (!str.trim()) return {};
-  try {
-    return JSON.parse(str);
-  } catch {
-    throw new Error('MALFORMED_JSON');
+function parseBody(req: any): Promise<any> {
+  if (req._body && Buffer.isBuffer(req._body)) {
+    const str = req._body.toString('utf8');
+    if (!str.trim()) return Promise.resolve({});
+    try {
+      return Promise.resolve(JSON.parse(str));
+    } catch {
+      return Promise.reject(new Error('MALFORMED_JSON'));
+    }
   }
+  return readBodyBuffer(req).then((buf) => {
+    if (buf.length === 0) return {};
+    const str = buf.toString('utf8');
+    if (!str.trim()) return {};
+    try {
+      return JSON.parse(str);
+    } catch {
+      throw new Error('MALFORMED_JSON');
+    }
+  });
 }
 
 export function createApp(): any {
@@ -316,11 +326,21 @@ export function createApp(): any {
         const slash2 = rest.indexOf('/', slash1 + 1);
         if (slash2 !== -1 && rest.slice(slash2) === '/issues') {
           let body: any = {};
-          try {
-            body = await parseBody(req);
-          } catch {
-            sendJson(res, 400, { message: 'Problems parsing JSON' });
-            return;
+          if (req._body && Buffer.isBuffer(req._body)) {
+            try {
+              const str = req._body.toString('utf8');
+              body = str.trim() ? JSON.parse(str) : {};
+            } catch {
+              sendJson(res, 400, { message: 'Problems parsing JSON' });
+              return;
+            }
+          } else {
+            try {
+              body = await parseBody(req);
+            } catch {
+              sendJson(res, 400, { message: 'Problems parsing JSON' });
+              return;
+            }
           }
           const repoKey = rest.slice(0, slash2);
           const repo = store.repos.get(repoKey);
