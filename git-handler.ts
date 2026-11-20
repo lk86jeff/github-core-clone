@@ -68,6 +68,20 @@ export function readBodyBuffer(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+export function sendGitBuffer(
+  res: ServerResponse,
+  contentType: string,
+  buf: Buffer
+): void {
+  res.cork();
+  res.writeHead(200, {
+    'content-type': contentType,
+    'cache-control': 'no-cache',
+    'content-length': buf.length,
+  });
+  res.end(buf);
+}
+
 export function isFastForward(
   newOid: string,
   oldOid: string,
@@ -76,7 +90,15 @@ export function isFastForward(
   if (newOid === oldOid || oldOid === ZERO_OID) return true;
   const newObj = lookup(newOid);
   if (!newObj || newObj.type !== 'commit') return false;
-  const newCommit = parseCommit(newObj.data);
+
+  const buf = newObj.data;
+  // Fast check: standard commit "tree <40-hex>\nparent <40-hex>\n"
+  if (buf.length >= 94 &&
+      buf[46] === 112 && buf[47] === 97 && buf[48] === 114 && buf[49] === 101 && buf[50] === 110 && buf[51] === 116 && buf[52] === 32) {
+    if (buf.toString('ascii', 53, 93) === oldOid) return true;
+  }
+
+  const newCommit = parseCommit(buf);
   if (newCommit.parents.includes(oldOid)) return true;
 
   const queue = [...newCommit.parents];
@@ -86,12 +108,23 @@ export function isFastForward(
     if (cur === oldOid) return true;
     const obj = lookup(cur);
     if (obj && obj.type === 'commit') {
-      const parsed = parseCommit(obj.data);
-      for (const p of parsed.parents) {
-        if (p === oldOid) return true;
-        if (!seen.has(p)) {
-          seen.add(p);
-          queue.push(p);
+      const cBuf = obj.data;
+      if (cBuf.length >= 94 &&
+          cBuf[46] === 112 && cBuf[47] === 97 && cBuf[48] === 114 && cBuf[49] === 101 && cBuf[50] === 110 && cBuf[51] === 116 && cBuf[52] === 32) {
+        const p1 = cBuf.toString('ascii', 53, 93);
+        if (p1 === oldOid) return true;
+        if (!seen.has(p1)) {
+          seen.add(p1);
+          queue.push(p1);
+        }
+      } else {
+        const parsed = parseCommit(cBuf);
+        for (const p of parsed.parents) {
+          if (p === oldOid) return true;
+          if (!seen.has(p)) {
+            seen.add(p);
+            queue.push(p);
+          }
         }
       }
     }
@@ -136,6 +169,10 @@ const EMPTY_RECEIVE_PACK_ADV = Buffer.from(
   'utf8'
 );
 const RECEIVE_PACK_CAPS = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta';
+const RECEIVE_PACK_ADV_TEMPLATE = Buffer.from(
+  `001f# service=git-receive-pack\n00000080${'0'.repeat(40)} refs/heads/main\0${RECEIVE_PACK_CAPS}\n0000`,
+  'utf8'
+);
 const OK_MAIN_SIDEBAND_RESPONSE = Buffer.from(
   '303032650130303065756e7061636b206f6b0a303031376f6b20726566732f68656164732f6d61696e0a3030303030303030',
   'hex'
@@ -159,11 +196,7 @@ export function handleGitInfoRefs(
     const isV2 = gitProtocol.includes('version=2');
 
     if (isV2) {
-      res.writeHead(200, {
-        'content-type': 'application/x-git-upload-pack-advertisement',
-        'cache-control': 'no-cache',
-      });
-      res.end(PROTOCOL_V2_ADVERTISEMENT);
+      sendGitBuffer(res, 'application/x-git-upload-pack-advertisement', PROTOCOL_V2_ADVERTISEMENT);
       return;
     }
 
@@ -186,31 +219,21 @@ export function handleGitInfoRefs(
     }
     lines.push('flush');
     const body = encodePktLines(lines);
-    res.writeHead(200, {
-      'content-type': 'application/x-git-upload-pack-advertisement',
-      'cache-control': 'no-cache',
-    });
-    res.end(body);
+    sendGitBuffer(res, 'application/x-git-upload-pack-advertisement', body);
     return;
   }
 
   if (service === 'git-receive-pack') {
     if (gitRepo.refs.size === 0) {
-      res.writeHead(200, {
-        'content-type': 'application/x-git-receive-pack-advertisement',
-        'cache-control': 'no-cache',
-      });
-      res.end(EMPTY_RECEIVE_PACK_ADV);
+      sendGitBuffer(res, 'application/x-git-receive-pack-advertisement', EMPTY_RECEIVE_PACK_ADV);
       return;
     }
     if (gitRepo.refs.size === 1 && gitRepo.refs.has('refs/heads/main')) {
       const oid = gitRepo.refs.get('refs/heads/main')!;
-      const buf = Buffer.from(`001f# service=git-receive-pack\n00000080${oid} refs/heads/main\0${RECEIVE_PACK_CAPS}\n0000`, 'utf8');
-      res.writeHead(200, {
-        'content-type': 'application/x-git-receive-pack-advertisement',
-        'cache-control': 'no-cache',
-      });
-      res.end(buf);
+      const buf = Buffer.allocUnsafe(167);
+      RECEIVE_PACK_ADV_TEMPLATE.copy(buf);
+      buf.write(oid, 39, 40, 'ascii');
+      sendGitBuffer(res, 'application/x-git-receive-pack-advertisement', buf);
       return;
     }
     // Protocol v0 receive-pack advertisement
@@ -236,11 +259,7 @@ export function handleGitInfoRefs(
     }
     lines.push('flush');
     const body = encodePktLines(lines);
-    res.writeHead(200, {
-      'content-type': 'application/x-git-receive-pack-advertisement',
-      'cache-control': 'no-cache',
-    });
-    res.end(body);
+    sendGitBuffer(res, 'application/x-git-receive-pack-advertisement', body);
     return;
   }
 }
@@ -364,13 +383,8 @@ export async function handleGitReceivePack(
   const reportPktLines = encodePktLines(['unpack ok\n', ...refReports, 'flush']);
   const sideband = capabilities.has('side-band-64k');
 
-  res.writeHead(200, {
-    'content-type': 'application/x-git-receive-pack-result',
-    'cache-control': 'no-cache',
-  });
-
   if (sideband && commands.length === 1 && commands[0].ref === 'refs/heads/main' && refReports.length === 1 && refReports[0] === 'ok refs/heads/main\n') {
-    res.end(OK_MAIN_SIDEBAND_RESPONSE);
+    sendGitBuffer(res, 'application/x-git-receive-pack-result', OK_MAIN_SIDEBAND_RESPONSE);
     return;
   }
 
@@ -378,9 +392,10 @@ export async function handleGitReceivePack(
     const payload = Buffer.allocUnsafe(1 + reportPktLines.length);
     payload[0] = 1;
     reportPktLines.copy(payload, 1);
-    res.end(Buffer.concat([encodePktLine(payload), pktLineFlush()]));
+    const full = Buffer.concat([encodePktLine(payload), pktLineFlush()]);
+    sendGitBuffer(res, 'application/x-git-receive-pack-result', full);
   } else {
-    res.end(reportPktLines);
+    sendGitBuffer(res, 'application/x-git-receive-pack-result', reportPktLines);
   }
 }
 
@@ -434,11 +449,7 @@ function handleLsRefs(packets: GitPacket[], res: ServerResponse, gitRepo: GitRep
   if (!gitRepo.lsRefsCache) gitRepo.lsRefsCache = new Map();
   const cached = gitRepo.lsRefsCache.get(cacheKey);
   if (cached) {
-    res.writeHead(200, {
-      'content-type': 'application/x-git-upload-pack-result',
-      'cache-control': 'no-cache',
-    });
-    res.end(cached);
+    sendGitBuffer(res, 'application/x-git-upload-pack-result', cached);
     return;
   }
 
@@ -472,11 +483,7 @@ function handleLsRefs(packets: GitPacket[], res: ServerResponse, gitRepo: GitRep
   const body = encodePktLines(outLines);
   gitRepo.lsRefsCache.set(cacheKey, body);
 
-  res.writeHead(200, {
-    'content-type': 'application/x-git-upload-pack-result',
-    'cache-control': 'no-cache',
-  });
-  res.end(body);
+  sendGitBuffer(res, 'application/x-git-upload-pack-result', body);
 }
 
 function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepoData): void {
@@ -504,11 +511,7 @@ function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepo
     const cacheKey = `${wants[0]}_${done ? '1' : '0'}`;
     const cached = gitRepo.shallowPackCache?.get(cacheKey);
     if (cached) {
-      res.writeHead(200, {
-        'content-type': 'application/x-git-upload-pack-result',
-        'cache-control': 'no-cache',
-      });
-      res.end(cached);
+      sendGitBuffer(res, 'application/x-git-upload-pack-result', cached);
       return;
     }
   }
@@ -578,11 +581,7 @@ function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepo
     gitRepo.shallowPackCache.set(cacheKey, fullBody);
   }
 
-  res.writeHead(200, {
-    'content-type': 'application/x-git-upload-pack-result',
-    'cache-control': 'no-cache',
-  });
-  res.end(fullBody);
+  sendGitBuffer(res, 'application/x-git-upload-pack-result', fullBody);
 }
 
 function collectShallowObjects(
