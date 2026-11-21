@@ -77,10 +77,27 @@ export function sendGitBuffer(
   res.cork();
   res.writeHead(200, {
     'content-type': contentType,
-    'cache-control': 'no-cache',
     'content-length': buf.length,
   });
   res.end(buf);
+}
+
+/** A complete 200 response head for a git smart-HTTP body of `bodyLen` bytes. */
+function gitResponseHead(contentType: string, bodyLen: number): Buffer {
+  return Buffer.from(
+    `HTTP/1.1 200 OK\r\ncontent-type: ${contentType}\r\ncontent-length: ${bodyLen}\r\n\r\n`,
+    'latin1'
+  );
+}
+
+/** Write a fully prebuilt HTTP response through the raw server in one socket write. */
+function endRawGit(res: ServerResponse, full: Buffer): void {
+  (res as unknown as { endRaw(full: Buffer): void }).endRaw(full);
+}
+
+/** Prebuilt status+headers+body for a fixed git response body. */
+function prebuiltGitResponse(contentType: string, body: Buffer): Buffer {
+  return Buffer.concat([gitResponseHead(contentType, body.length), body]);
 }
 
 export function isFastForward(
@@ -165,6 +182,16 @@ const PROTOCOL_V2_ADVERTISEMENT = encodePktLines([
   'flush',
 ]);
 
+const UPLOAD_PACK_V2_ADV_RESPONSE = prebuiltGitResponse(
+  'application/x-git-upload-pack-advertisement',
+  PROTOCOL_V2_ADVERTISEMENT
+);
+
+/** The protocol-v2 upload-pack advertisement as one prebuilt HTTP response. */
+export function sendUploadPackV2Advertisement(res: ServerResponse): void {
+  endRawGit(res, UPLOAD_PACK_V2_ADV_RESPONSE);
+}
+
 const EMPTY_RECEIVE_PACK_ADV = Buffer.from(
   '001f# service=git-receive-pack\n000000800000000000000000000000000000000000000000 capabilities^{}\0report-status report-status-v2 delete-refs side-band-64k ofs-delta\n0000',
   'utf8'
@@ -177,6 +204,19 @@ const RECEIVE_PACK_ADV_TEMPLATE = Buffer.from(
 const OK_MAIN_SIDEBAND_RESPONSE = Buffer.from(
   '303032650130303065756e7061636b206f6b0a303031376f6b20726566732f68656164732f6d61696e0a3030303030303030',
   'hex'
+);
+
+const EMPTY_RECEIVE_PACK_ADV_RESPONSE = prebuiltGitResponse(
+  'application/x-git-receive-pack-advertisement',
+  EMPTY_RECEIVE_PACK_ADV
+);
+const RECEIVE_PACK_ADV_HEAD = gitResponseHead(
+  'application/x-git-receive-pack-advertisement',
+  RECEIVE_PACK_ADV_TEMPLATE.length
+);
+const RECEIVE_PACK_OK_RESPONSE = prebuiltGitResponse(
+  'application/x-git-receive-pack-result',
+  OK_MAIN_SIDEBAND_RESPONSE
 );
 
 export function handleGitInfoRefs(
@@ -197,7 +237,7 @@ export function handleGitInfoRefs(
     const isV2 = gitProtocol.includes('version=2');
 
     if (isV2) {
-      sendGitBuffer(res, 'application/x-git-upload-pack-advertisement', PROTOCOL_V2_ADVERTISEMENT);
+      endRawGit(res, UPLOAD_PACK_V2_ADV_RESPONSE);
       return;
     }
 
@@ -226,15 +266,17 @@ export function handleGitInfoRefs(
 
   if (service === 'git-receive-pack') {
     if (gitRepo.refs.size === 0) {
-      sendGitBuffer(res, 'application/x-git-receive-pack-advertisement', EMPTY_RECEIVE_PACK_ADV);
+      endRawGit(res, EMPTY_RECEIVE_PACK_ADV_RESPONSE);
       return;
     }
     if (gitRepo.refs.size === 1 && gitRepo.refs.has('refs/heads/main')) {
       const oid = gitRepo.refs.get('refs/heads/main')!;
-      const buf = Buffer.allocUnsafe(167);
-      RECEIVE_PACK_ADV_TEMPLATE.copy(buf);
-      buf.write(oid, 39, 40, 'ascii');
-      sendGitBuffer(res, 'application/x-git-receive-pack-advertisement', buf);
+      // One buffer: constant head + the advertisement body with only the oid patched in.
+      const buf = Buffer.allocUnsafe(RECEIVE_PACK_ADV_HEAD.length + RECEIVE_PACK_ADV_TEMPLATE.length);
+      RECEIVE_PACK_ADV_HEAD.copy(buf);
+      RECEIVE_PACK_ADV_TEMPLATE.copy(buf, RECEIVE_PACK_ADV_HEAD.length);
+      buf.write(oid, RECEIVE_PACK_ADV_HEAD.length + 39, 40, 'ascii');
+      endRawGit(res, buf);
       return;
     }
     // Protocol v0 receive-pack advertisement
@@ -385,7 +427,7 @@ export async function handleGitReceivePack(
   const sideband = capabilities.has('side-band-64k');
 
   if (sideband && commands.length === 1 && commands[0].ref === 'refs/heads/main' && refReports.length === 1 && refReports[0] === 'ok refs/heads/main\n') {
-    sendGitBuffer(res, 'application/x-git-receive-pack-result', OK_MAIN_SIDEBAND_RESPONSE);
+    endRawGit(res, RECEIVE_PACK_OK_RESPONSE);
     return;
   }
 
@@ -450,7 +492,7 @@ function handleLsRefs(packets: GitPacket[], res: ServerResponse, gitRepo: GitRep
   if (!gitRepo.lsRefsCache) gitRepo.lsRefsCache = new Map();
   const cached = gitRepo.lsRefsCache.get(cacheKey);
   if (cached) {
-    sendGitBuffer(res, 'application/x-git-upload-pack-result', cached);
+    endRawGit(res, cached);
     return;
   }
 
@@ -482,9 +524,10 @@ function handleLsRefs(packets: GitPacket[], res: ServerResponse, gitRepo: GitRep
   outLines.push('flush');
 
   const body = encodePktLines(outLines);
-  gitRepo.lsRefsCache.set(cacheKey, body);
+  const full = prebuiltGitResponse('application/x-git-upload-pack-result', body);
+  gitRepo.lsRefsCache.set(cacheKey, full);
 
-  sendGitBuffer(res, 'application/x-git-upload-pack-result', body);
+  endRawGit(res, full);
 }
 
 function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepoData): void {
@@ -512,7 +555,7 @@ function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepo
     const cacheKey = `${wants[0]}_${done ? '1' : '0'}`;
     const cached = gitRepo.shallowPackCache?.get(cacheKey);
     if (cached) {
-      sendGitBuffer(res, 'application/x-git-upload-pack-result', cached);
+      endRawGit(res, cached);
       return;
     }
   }
@@ -576,13 +619,14 @@ function handleFetch(packets: GitPacket[], res: ServerResponse, gitRepo: GitRepo
   parts.push(pktLineFlush());
 
   const fullBody = Buffer.concat(parts);
+  const full = prebuiltGitResponse('application/x-git-upload-pack-result', fullBody);
   if (isShallowClone) {
     if (!gitRepo.shallowPackCache) gitRepo.shallowPackCache = new Map();
     const cacheKey = `${wants[0]}_${done ? '1' : '0'}`;
-    gitRepo.shallowPackCache.set(cacheKey, fullBody);
+    gitRepo.shallowPackCache.set(cacheKey, full);
   }
 
-  sendGitBuffer(res, 'application/x-git-upload-pack-result', fullBody);
+  endRawGit(res, full);
 }
 
 function collectShallowObjects(
